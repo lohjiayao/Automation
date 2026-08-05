@@ -74,7 +74,6 @@ attention, and a table naming every overdue project and its owner.
 | [`Scripts/`](Scripts/) | The three Office Scripts (TypeScript), as plain text |
 | [`Connection_Tracker.xlsx`](Connection_Tracker.xlsx) | Reference tracker: Target Date model, Settings-driven config, calculated priority column |
 | [`Finance_Email_Format_Request.md`](Finance_Email_Format_Request.md) | The standard email format requested from Finance to make notifications machine-readable |
-| [`PowerAutomate_Build_Guide.md`](PowerAutomate_Build_Guide.md) | Earlier, more detailed build notes and design rationale (superseded in places by `PowerAutomate_Steps.md`, kept for context) |
 
 ### The Office Scripts
 
