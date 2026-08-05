@@ -1,0 +1,128 @@
+// Office Script: MarkProjectPaid
+// Flow: Payment Watcher (triggers on incoming "CC Bill Paid" emails)
+// Reads the Connection Charge payment out of a Finance email (subject + body content),
+// matches it to a project in the tracker, and marks it paid. Handles repeat Finance
+// reminders (including replies to the original email) without overwriting the paid date.
+// If the project isn't in the tracker yet, it creates the row and flags it for the
+// engineer to verify the reference number.
+
+function main(
+  workbook: ExcelScript.Workbook,
+  emailSubject: string,
+  emailBody: string,
+  emailSender: string
+): string {
+  const subj = emailSubject || "";
+  const body = emailBody || "";
+  const today = Math.floor((Date.now() - Date.UTC(1899, 11, 30)) / 86400000);
+  const norm = (s: string) => s.toUpperCase().replace(/[-\s]/g, "");
+
+  // Every email address the script needs comes from the Settings sheet - nothing
+  // hardcoded, so the same script works in anyone's copy of the tracker.
+  const cfg = workbook.getWorksheet("Settings");
+  const defaultEmail = String(cfg.getRange("B5").getValue()).trim();
+  const engineerEmail = String(cfg.getRange("B6").getValue()).trim();
+
+  const log = (ref: string, action: string) => {
+    const s = workbook.getWorksheet("Email Log");
+    const used = s.getUsedRange();
+    const r = used ? used.getRowCount() : 1;
+    s.getRangeByIndexes(r, 0, 1, 5).setValues([[
+      new Date().toLocaleString(), emailSender || "", subj, ref, action
+    ]]);
+  };
+
+  // Content-based extraction: read the BODY first (a reply's quoted content usually
+  // carries the full details), then fall back to the subject.
+  const pat = /\b(SIB-?\d{6}|SQ-?\d{4,5})\b/i;
+  const patAll = /\b(SIB-?\d{6}|SQ-?\d{4,5})\b/gi;
+  const seen: string[] = [];
+  for (const mm of (body + " " + subj).match(patAll) || []) {
+    if (seen.indexOf(norm(mm)) < 0) seen.push(norm(mm));
+  }
+  let m = body.match(pat) || subj.match(pat);
+  if (!m) {
+    log("", "No reference found");
+    return JSON.stringify({ updated: false, action: "no-ref", refsFound: 0, engineerEmail });
+  }
+  const ref = m[0].toUpperCase();
+  const refKey = norm(ref);
+
+  // Pull customer + amount straight from the Finance email's plain-text body block.
+  let customer = "";
+  const cm = body.match(/Customer\s*:\s*(.+)/i);
+  if (cm) customer = cm[1].trim();
+  const am = body.match(/Amount[^\d]*([\d,]+\.?\d*)/i);
+  const amount = am ? am[1] : "";
+
+  const table = workbook.getTable("ProjectTracker");
+  const range = table.getRangeBetweenHeaderAndTotal();
+  const values = range.getValues();
+
+  // Column positions (0-based): 1 Customer, 3 Officer Email (formula), 4 Conn. Charge Paid,
+  // 5 Conn. Paid Date, 6 Other Charge Status, 12 Finance Reminders, 13 Last Reminder Date.
+  for (let i = 0; i < values.length; i++) {
+    if (norm(String(values[i][0])) !== refKey) continue;
+    const officerEmail = String(values[i][3]).trim() || defaultEmail;
+    const rowCustomer = String(values[i][1]) || customer;
+    const alreadyPaid = String(values[i][4]) === "Yes";
+
+    if (!alreadyPaid) {
+      // First payment: fill only the two payment cells. Everything else the team
+      // typed in (customer, officer, status, target date, remarks) is left untouched.
+      range.getCell(i, 4).setValue("Yes");
+      range.getCell(i, 5).setValue(today);
+      range.getCell(i, 5).setNumberFormatLocal("DD/MM/YYYY");
+      log(ref, "Marked paid" + (amount ? " (RM" + amount + ")" : ""));
+      return JSON.stringify({
+        updated: true, action: "paid", ref: ref, refsFound: seen.length,
+        customer: rowCustomer, officerEmail: officerEmail, engineerEmail: engineerEmail
+      });
+    }
+
+    // Already paid: this email - a fresh chase OR a reply to the original - is a
+    // REMINDER. Never overwrite the original paid date; that would reset the aging
+    // and make a stuck project look newer (and less urgent) than it really is.
+    if (Number(values[i][13]) === today) {
+      // Cap at one counted reminder per project per day, so a resend/duplicate
+      // delivery on the same day doesn't inflate the count.
+      log(ref, "Reminder same day - ignored");
+      return JSON.stringify({ updated: false, action: "dup-same-day", ref: ref, engineerEmail });
+    }
+    const count = (Number(values[i][12]) || 0) + 1;
+    range.getCell(i, 12).setValue(count);
+    range.getCell(i, 13).setValue(today);
+    range.getCell(i, 13).setNumberFormatLocal("DD/MM/YYYY");
+    log(ref, "Finance reminder #" + count);
+    return JSON.stringify({
+      updated: true, action: "reminder", ref: ref, reminderCount: count,
+      customer: rowCustomer, officerEmail: officerEmail, engineerEmail: engineerEmail
+    });
+  }
+
+  // No matching row: create one so the payment is never lost, and ask the engineer
+  // to verify the reference number (Finance may have mistyped it).
+  if (!customer) {
+    const parts = subj.split(ref);
+    if (parts.length > 1) customer = parts[1].replace(/^[\s\-:]+/, "").trim();
+  }
+  table.addRow(-1, [
+    ref, customer, "", "", "Yes", today, "Not Started", "", "", "",
+    "", "", 0, "", "", "Auto-added from Finance payment - verify number"
+  ]);
+  const b = table.getRangeBetweenHeaderAndTotal();
+  const n = b.getRowCount();
+  b.getCell(n - 1, 5).setNumberFormatLocal("DD/MM/YYYY");
+  // Calculated columns (Officer Email, Days vs Target, Priority) should fill
+  // themselves via the table's calculated-column formulas; copy down as a safeguard.
+  if (n >= 2) {
+    for (const c of [3, 8, 14]) {
+      b.getCell(n - 1, c).copyFrom(b.getCell(n - 2, c), ExcelScript.RangeCopyType.formulas);
+    }
+  }
+  log(ref, "Auto-added new project");
+  return JSON.stringify({
+    updated: true, action: "created", ref: ref, refsFound: seen.length,
+    customer: customer, officerEmail: defaultEmail, engineerEmail: engineerEmail
+  });
+}

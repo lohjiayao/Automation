@@ -1,0 +1,113 @@
+// Office Script: GetWeeklySummary
+// Flow: Weekly Summary (scheduled, runs once a week)
+// Gives the whole team a bird's-eye view: headline counts by state, plus a table of
+// the longest-outstanding overdue projects and who owns them. Sent to everyone with
+// an email in the Settings sheet (the officer directory + default/engineer/manager).
+
+function main(workbook: ExcelScript.Workbook): string {
+  const cfg = workbook.getWorksheet("Settings");
+  const escalateDays = Number(cfg.getRange("B2").getValue());
+  const dueSoonDays = Number(cfg.getRange("B3").getValue());
+  const today = Math.floor((Date.now() - Date.UTC(1899, 11, 30)) / 86400000);
+
+  // Recipients = every email in Settings (officer directory E2:E50 + B5/B6/B7), trimmed & deduped.
+  const recips: string[] = [];
+  const addR = (e: string) => {
+    e = String(e).trim();
+    if (e.indexOf("@") > 0 && recips.indexOf(e) < 0) recips.push(e);
+  };
+  for (const r of cfg.getRange("E2:E50").getValues()) addR(String(r[0]));
+  addR(String(cfg.getRange("B5").getValue()));
+  addR(String(cfg.getRange("B6").getValue()));
+  addR(String(cfg.getRange("B7").getValue()));
+
+  const table = workbook.getTable("ProjectTracker");
+  const values = table.getRangeBetweenHeaderAndTotal().getValues();
+
+  let total = 0, urgent = 0, escalate = 0, overdue = 0, dueSoon = 0,
+      onTrack = 0, snoozed = 0, done = 0, rejected = 0;
+  const late: { ref: string; customer: string; officer: string; status: string; days: number }[] = [];
+
+  for (const row of values) {
+    const ref = String(row[0]).trim();
+    if (!ref) continue;
+    total++;
+    const customer = String(row[1]);
+    const officer = String(row[2]);
+    const paid = String(row[4]) === "Yes";
+    const paidDate = Number(row[5]);
+    const status = String(row[6]);
+    const target = Number(row[7]);
+    const snooze = Number(row[11]);
+
+    if (status === "Rejected - Pending Resubmission") rejected++;
+    if (status === "Completed" || status === "Approved") { done++; continue; }
+    if (snooze && snooze >= today) { snoozed++; continue; }
+
+    if (paid && status === "Not Started") {
+      urgent++;
+      late.push({ ref, customer, officer, status, days: paidDate ? today - paidDate : 0 });
+      continue;
+    }
+    if (!paid && status === "Not Started") { onTrack++; continue; }
+    if (!target) { onTrack++; continue; }
+
+    const overBy = today - target;
+    if (overBy >= escalateDays) { escalate++; late.push({ ref, customer, officer, status, days: overBy }); }
+    else if (overBy > 0) { overdue++; late.push({ ref, customer, officer, status, days: overBy }); }
+    else if (overBy >= -dueSoonDays) dueSoon++;
+    else onTrack++;
+  }
+
+  const active = total - done;
+  const needsAttention = urgent + escalate + overdue;
+  late.sort((a, b) => b.days - a.days);
+
+  const th = "padding:6px 12px;text-align:left;border-bottom:2px solid #444;";
+  const td = "padding:5px 12px;border-bottom:1px solid #ddd;";
+  const tdR = td + "text-align:center;";
+  const counts: [string, number, string][] = [
+    ["Completed / Approved", done, "#548235"],
+    ["Paid - not listed (URGENT)", urgent, "#C00000"],
+    ["Overdue - escalate", escalate, "#C00000"],
+    ["Overdue", overdue, "#E36C09"],
+    ["Due soon", dueSoon, "#BF8F00"],
+    ["On track", onTrack, "#548235"],
+    ["Snoozed", snoozed, "#7F7F7F"],
+    ["In rework (rejected)", rejected, "#E36C09"],
+  ];
+
+  let html = '<div style="font-family:Arial,sans-serif;font-size:13px;color:#000;">'
+    + '<h2 style="margin:0 0 4px;">Weekly Other Charge Summary</h2>'
+    + '<p style="margin:0 0 12px;color:#666;">' + new Date().toLocaleDateString() + '</p>'
+    + '<p><b>' + active + '</b> active &nbsp;|&nbsp; <b style="color:#C00000;">'
+    + needsAttention + '</b> need attention &nbsp;|&nbsp; <b>' + done + '</b> completed to date</p>'
+    + '<table style="border-collapse:collapse;font-size:13px;margin:8px 0;">'
+    + '<tr><th style="' + th + '">Category</th><th style="' + th + '">Count</th></tr>';
+  for (const c of counts) {
+    html += '<tr><td style="' + td + '">' + c[0] + '</td>'
+      + '<td style="' + tdR + 'font-weight:bold;color:' + c[2] + ';">' + c[1] + '</td></tr>';
+  }
+  html += '</table>';
+
+  if (late.length) {
+    html += '<h3 style="margin:16px 0 4px;">Who is overdue</h3>'
+      + '<table style="border-collapse:collapse;font-size:13px;">'
+      + '<tr><th style="' + th + '">Project</th><th style="' + th + '">Customer</th>'
+      + '<th style="' + th + '">Officer</th><th style="' + th + '">Status</th>'
+      + '<th style="' + th + '">Days</th></tr>';
+    for (const it of late) {
+      html += '<tr><td style="' + td + '">' + it.ref + '</td>'
+        + '<td style="' + td + '">' + (it.customer || "-") + '</td>'
+        + '<td style="' + td + '">' + (it.officer || "-") + '</td>'
+        + '<td style="' + td + '">' + it.status + '</td>'
+        + '<td style="' + tdR + 'font-weight:bold;">' + it.days + '</td></tr>';
+    }
+    html += '</table>';
+  } else {
+    html += '<p style="color:#548235;"><b>Nothing overdue this week.</b></p>';
+  }
+  html += '<p style="color:#666;font-size:12px;margin-top:12px;">Automated weekly team summary.</p></div>';
+
+  return JSON.stringify({ recipients: recips.join(";"), needsAttention: needsAttention, active: active, html: html });
+}

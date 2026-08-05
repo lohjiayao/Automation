@@ -1,0 +1,122 @@
+// Office Script: GetOverdueProjects
+// Flow: Daily Watchdog (scheduled, runs every morning)
+// Scans every active project and works out what needs chasing today. Routes by the
+// Other Charge Status (who currently holds the ball) and by Target Date (how late it
+// is). Returns ONE consolidated email - not a per-project email - so a quiet day
+// sends nothing and a busy day sends exactly one summary.
+
+function main(workbook: ExcelScript.Workbook): string {
+  const cfg = workbook.getWorksheet("Settings");
+  const escalateDays = Number(cfg.getRange("B2").getValue());
+  const defaultEmail = String(cfg.getRange("B5").getValue()).trim();
+  const engineerEmail = String(cfg.getRange("B6").getValue()).trim();
+  const managerEmail = String(cfg.getRange("B7").getValue()).trim();
+  const today = Math.floor((Date.now() - Date.UTC(1899, 11, 30)) / 86400000);
+
+  const table = workbook.getTable("ProjectTracker");
+  const values = table.getRangeBetweenHeaderAndTotal().getValues();
+
+  interface Item {
+    ref: string; customer: string; officer: string; status: string;
+    reason: string; days: number;
+  }
+  const items: Item[] = [];
+  const recips: string[] = [];
+  const addRecip = (e: string) => {
+    e = String(e).trim();
+    if (e.indexOf("@") > 0 && recips.indexOf(e) < 0) recips.push(e);
+  };
+
+  for (const row of values) {
+    const ref = String(row[0]).trim();
+    if (!ref) continue;
+    const customer = String(row[1]);
+    const officer = String(row[2]);
+    const officerEmail = String(row[3]).trim() || defaultEmail;
+    const paid = String(row[4]) === "Yes";
+    const paidDate = Number(row[5]);
+    const status = String(row[6]);
+    const target = Number(row[7]);
+    const snooze = Number(row[11]);
+
+    if (status === "Completed" || status === "Approved") continue;   // DONE - never chase
+    if (snooze && snooze >= today) continue;                          // SNOOZED - not yet
+
+    const overBy = target ? today - target : 0;
+    let reason = "", notify = "";
+
+    // Routing: badly overdue -> escalate to Engineer + Manager. Otherwise, route by
+    // who currently holds the project (its Status), not by who created it.
+    if (target && overBy >= escalateDays) {
+      reason = "ESCALATED";
+      notify = engineerEmail + ";" + managerEmail;
+    } else if (status === "Pending Engineer" || status === "Keyed into SAP") {
+      reason = "PENDING APPROVAL";
+      notify = engineerEmail;
+    } else if (status === "Pending Manager") {
+      reason = "PENDING APPROVAL";
+      notify = managerEmail;
+    } else if (paid && status === "Not Started") {
+      // Connection charge paid but the Other Charge hasn't been listed in SAP yet -
+      // money is sitting in suspense until the operator acts.
+      reason = "URGENT - LIST CHARGE";
+      notify = officerEmail;
+    } else if (target && overBy > 0) {
+      reason = "OVERDUE";
+      notify = officerEmail;
+    } else {
+      continue; // on track / due soon / awaiting customer payment - nothing to send
+    }
+
+    const days = (reason === "URGENT - LIST CHARGE")
+      ? (paidDate ? today - paidDate : 0)
+      : overBy;
+    items.push({ ref, customer, officer, status, reason, days });
+    for (const e of notify.split(";")) addRecip(e);
+  }
+
+  if (items.length === 0) {
+    return JSON.stringify({ recipients: "", count: 0, html: "" });
+  }
+
+  const order = ["ESCALATED", "PENDING APPROVAL", "URGENT - LIST CHARGE", "OVERDUE"];
+  items.sort((a, b) =>
+    (order.indexOf(a.reason) - order.indexOf(b.reason)) || (b.days - a.days));
+
+  const colour: { [k: string]: string } = {
+    "ESCALATED": "#C00000", "PENDING APPROVAL": "#7030A0",
+    "OVERDUE": "#E36C09", "URGENT - LIST CHARGE": "#C00000"
+  };
+  let esc = 0, pend = 0, other = 0;
+  for (const it of items) {
+    if (it.reason === "ESCALATED") esc++;
+    else if (it.reason === "PENDING APPROVAL") pend++;
+    else other++;
+  }
+  const parts: string[] = [];
+  if (esc) parts.push("<b style='color:#C00000;'>" + esc + " escalated</b>");
+  if (pend) parts.push("<b style='color:#7030A0;'>" + pend + " pending approval</b>");
+  if (other) parts.push("<b>" + other + " to action</b>");
+
+  const th = "padding:6px 10px;text-align:left;border-bottom:2px solid #444;";
+  const td = "padding:6px 10px;border-bottom:1px solid #ddd;";
+  let html = '<div style="font-family:Arial,sans-serif;font-size:13px;color:#000;">'
+    + '<h3 style="margin:0 0 6px;">Daily Other Charge Check</h3>'
+    + "<p>" + parts.join(" &nbsp;|&nbsp; ") + "</p>"
+    + '<table style="border-collapse:collapse;font-size:13px;"><tr>'
+    + '<th style="' + th + '">Reason</th><th style="' + th + '">Project</th>'
+    + '<th style="' + th + '">Customer</th><th style="' + th + '">Officer</th>'
+    + '<th style="' + th + '">Status</th><th style="' + th + '">Days</th></tr>';
+  for (const it of items) {
+    html += "<tr><td style=\"" + td + "font-weight:bold;color:" + (colour[it.reason] || "#000") + ";\">"
+      + it.reason + "</td>"
+      + '<td style="' + td + '">' + it.ref + "</td>"
+      + '<td style="' + td + '">' + (it.customer || "-") + "</td>"
+      + '<td style="' + td + '">' + (it.officer || "-") + "</td>"
+      + '<td style="' + td + '">' + it.status + "</td>"
+      + '<td style="' + td + 'text-align:center;">' + (it.days > 0 ? "+" + it.days : it.days) + "</td></tr>";
+  }
+  html += "</table><p style=\"color:#666;font-size:12px;\">Automated daily check.</p></div>";
+
+  return JSON.stringify({ recipients: recips.join(";"), count: items.length, html: html });
+}

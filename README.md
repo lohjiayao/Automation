@@ -1,4 +1,4 @@
-# Connection Charge Tracking Automation
+# Connection & Other Charge Tracking Automation
 
 A Microsoft 365 automation that stops paid customer projects from being forgotten while
 they wait for internal action — built without modifying any of the underlying enterprise
@@ -10,24 +10,25 @@ Created during an engineering internship with a utility's network planning team.
 
 ## The problem
 
-When a customer paid a connection charge, Finance emailed the planning team. From there,
-acting on it depended entirely on a person remembering:
+A customer pays two charges: a **Connection Charge**, and afterwards an **Other Charge**
+that an operator lists in the ERP and an engineer/manager approve. Acting on it depended
+entirely on people remembering:
 
-- The email landed in **one busy inbox**, and the payment status never reached the shared
+- Payment notification emails landed in **one busy inbox**, and never reached the shared
   tracking spreadsheet.
-- When an engineer **rejected** a cost estimate, the approval task was completed and vanished
-  from their inbox. Nothing in any system still held the item open.
+- When an engineer **rejected** a submitted charge, the approval task was completed and
+  vanished from their inbox. Nothing in any system still held the item open.
 - So a project whose customer had **already paid** could sit untouched — and nobody found out
-  until the customer complained.
+  until Finance chased for the outstanding amount weeks later.
 
 ## The constraint
 
-The two systems involved — the ERP (SAP) and the customer-facing application portal — **could
-not be modified.** No configuration changes, no plugins, no change requests.
+The two systems involved — the ERP and the customer-facing application portal — **could not
+be modified.** No configuration changes, no plugins, no change requests.
 
 So the solution had to sit entirely outside them, using tools the organisation already
-licensed: Power Automate, Excel Online, Outlook and SharePoint. Every connector used is a
-standard Microsoft 365 one — no premium licensing.
+licensed: Power Automate, Excel Online, and Outlook. Every connector used is a standard
+Microsoft 365 one — no premium licensing.
 
 ---
 
@@ -35,27 +36,33 @@ standard Microsoft 365 one — no premium licensing.
 
 ```mermaid
 flowchart TD
-    A["📧 Finance payment email arrives"] --> B["Html to text<br/><i>strip HTML markup</i>"]
-    B --> C["Run Office Script<br/><b>MarkProjectPaid</b>"]
-    C --> D["Parse JSON<br/><i>read the script's result</i>"]
-    D --> E{"Project matched<br/>in tracker?"}
-    E -- yes --> F["✅ Row marked Paid<br/>Priority turns red<br/>Officer notified"]
-    E -- no --> G["⚠️ Alert supervisor<br/><i>project not in tracker</i>"]
+    A["📧 Finance payment email arrives"] --> B["Extract project number + customer<br/><i>from email content</i>"]
+    B --> C{"Project matched<br/>in tracker?"}
+    C -- "not yet paid" --> D["✅ Marked Paid<br/>Priority turns red"]
+    C -- "already paid" --> E["📌 Treated as a Finance reminder<br/>SLA clock not reset"]
+    C -- "no match" --> F["➕ Row auto-created<br/>Engineer asked to verify the number"]
 
-    H["🕗 Daily 08:00 schedule"] --> I["Run Office Script<br/><b>GetOverdueProjects</b>"]
-    I --> J{"Check each<br/>open project"}
-    J -- "paid, no budget assigned" --> K["Chase assigned officer"]
-    J -- "past SLA" --> L["Escalate to engineer"]
+    G["🕗 Daily 08:00 check"] --> H["One consolidated email<br/><i>who needs to act, and why</i>"]
+    H --> I["Escalated → Engineer + Manager"]
+    H --> J["Pending approval → Engineer / Manager"]
+    H --> K["Paid, not listed / Overdue → Officer"]
+
+    L["🗓️ Weekly check"] --> M["Team-wide summary<br/>counts by state + who is overdue"]
 ```
 
-**Flow 1 — Payment Watcher.** Reads the project reference out of the email subject, finds that
-row in the tracker, marks it paid, and notifies the assigned officer. Around eight seconds,
-no human involvement.
+**Flow 1 — Payment Watcher.** Reads the project reference and customer name straight out of
+the Finance email's content, updates the matching tracker row, and logs the email. A repeat
+Finance reminder (even a reply to the original) is recognised and counted without resetting
+the payment date. An unmatched project is added automatically rather than lost.
 
-**Flow 2 — Daily Watchdog.** Every morning it checks for projects that have stopped moving and
-chases whoever owns them. Crucially, this needs **no signal from the ERP at all** — it detects
-a *stall*, so it catches a forgotten rejection, an officer on leave, or a submission nobody
-looked at, all with one mechanism.
+**Flow 2 — Daily Watchdog.** Every morning, one consolidated email tells each relevant person
+what needs action — routed by who currently holds the project (operator, engineer, or
+manager), not by who raised it. Needs no signal from the ERP: it detects a *stall* by
+comparing status against a target date, so it catches a forgotten rejection just as well as
+an unassigned project.
+
+**Flow 3 — Weekly Summary.** A team-wide picture — how many completed, how many need
+attention, and a table naming every overdue project and its owner.
 
 ---
 
@@ -63,45 +70,53 @@ looked at, all with one mechanism.
 
 | File | What it is |
 |---|---|
-| [`PowerAutomate_Build_Guide.md`](PowerAutomate_Build_Guide.md) | Full build guide — all three Office Scripts (TypeScript) plus step-by-step flow configuration |
-| [`Connection_Tracker.xlsx`](Connection_Tracker.xlsx) | The tracker: automatic priority, SLA aging, calculated columns, conditional formatting |
+| [`PowerAutomate_Steps.md`](PowerAutomate_Steps.md) | Exact build steps for all three flows — triggers, actions, schemas |
+| [`Scripts/`](Scripts/) | The three Office Scripts (TypeScript), as plain text |
+| [`Connection_Tracker.xlsx`](Connection_Tracker.xlsx) | Reference tracker: Target Date model, Settings-driven config, calculated priority column |
 | [`Finance_Email_Format_Request.md`](Finance_Email_Format_Request.md) | The standard email format requested from Finance to make notifications machine-readable |
+| [`PowerAutomate_Build_Guide.md`](PowerAutomate_Build_Guide.md) | Earlier, more detailed build notes and design rationale (superseded in places by `PowerAutomate_Steps.md`, kept for context) |
 
 ### The Office Scripts
 
-- **`MarkProjectPaid`** — extracts the project reference from an email and updates the matching row
-- **`GetOverdueProjects`** — returns everything breaching its SLA, with an escalation level per item
-- **`MarkProjectRejected`** — records a rejection, restarts the SLA clock, increments the rework counter
+- **`MarkProjectPaid`** — reads a Finance payment email, updates or creates the matching tracker row, logs every email processed
+- **`GetOverdueProjects`** — the daily check; routes by status (who holds the project) and target date (how late), returns one consolidated email
+- **`GetWeeklySummary`** — the weekly team-wide picture: counts by state, and who is overdue
 
 ---
 
 ## Design decisions worth noting
 
-**The SLA lives in the spreadsheet, not the code.** Different project types have different
-deadlines (10, 12 or 14 days). Rather than hardcoding a rule, each row carries its own SLA
-value and every calculation derives from it — so when practice changes, nobody needs a
-developer.
+**Everything configurable lives in a Settings sheet, not in code.** Thresholds, the default/
+engineer/manager emails, and the officer directory are all there. Changing who gets notified,
+or how late is "too late," is a spreadsheet edit — never a script edit.
 
-**Match on the subject phrase, not the sender.** Different people in Finance send these
-emails from their own accounts, but the subject wording is consistent.
+**The deadline is a Target Date, not a day-count formula.** Each project carries its own date,
+matching how the team already tracks deadlines on paper. "Days vs Target" is computed from it;
+nobody has to remember what an SLA number means.
 
-**Payment alone isn't the finish line.** Finance's emails specifically concern payments that
-have landed *without a budget assignment* — the money sits in a suspense account until
-someone acts. So the tracker tracks that separately and keeps chasing until it's confirmed.
+**Match on the email's subject wording, not the sender.** Different Finance staff send these
+emails from their own accounts, but the phrasing is consistent.
 
-**Multi-project emails can't be silently half-handled.** The script counts every reference it
-finds and warns when there's more than one. Marking one project and quietly ignoring two
-others would recreate the exact failure the project exists to prevent.
+**A repeat Finance email is a reminder, not a new payment.** Marking a project paid a second
+time never overwrites the original paid date — that would reset its aging and make a stuck
+project look newer than it is. Instead a reminder counter increments, which also correctly
+treats a reply to the original email as a second chase.
 
-**AI extraction was evaluated and rejected.** AI Builder could parse these emails, but it needs
-premium credits, and a deterministic pattern match against an agreed format is more reliable
-and fully explainable from the run history. AI would only earn its place doing OCR on a pasted
-screenshot — which a plain-text email block solves for free.
+**Who gets emailed is decided by the project's status, not a fixed owner.** A project pending
+engineer approval chases the engineer; pending manager approval chases the manager; paid-but-
+unlisted or overdue work chases the assigned operator. Nobody is nagged about work that isn't
+theirs.
 
-**Nothing production-critical should depend on one person's account.** Office Scripts live in
-the author's OneDrive and flows watch their creator's mailbox, so both would break when that
-account is disabled. The handover path moves the flow to a shared mailbox and the script to
-SharePoint.
+**A payment for an unmatched project is never dropped.** The row is created automatically and
+the engineer is asked to verify the reference number, in case it was mistyped.
+
+**AI extraction was evaluated and rejected.** A deterministic pattern match against an agreed
+email format is reliable and fully explainable from the run history; AI Builder would add
+licensing cost for a job pattern matching already does well.
+
+**Nothing production-critical should depend on one person's account.** Office Scripts are
+private to whoever creates them, and a flow watches its owner's mailbox. Both need to move to
+a shared owner (or a shared mailbox) before the person who built this leaves.
 
 ---
 
