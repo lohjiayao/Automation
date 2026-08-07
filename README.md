@@ -6,6 +6,8 @@ systems.
 
 Created during an engineering internship with a utility's network planning team.
 
+**Demo:** [youtu.be/eXGyKPdAnco](https://youtu.be/eXGyKPdAnco)
+
 ---
 
 ## The problem
